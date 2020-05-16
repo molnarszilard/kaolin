@@ -1,4 +1,4 @@
-# Copyright (c) 2020, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2019, NVIDIA CORPORATION. All rights reserved.
 
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -26,7 +26,24 @@ from kaolin.helpers import _composedecorator
 
 import kaolin.cuda.load_textures as load_textures_cuda
 import kaolin as kal
+import rospy
+import yaml
+import sensor_msgs.point_cloud2 as pc2
+#import pcl.msg
+from pcl_msgs.msg import PolygonMesh
+import sensor_msgs.msg
+import std_msgs.msg
+import time
+#include <pcl_msgs/PolygonMesh.h>
 
+import struct
+
+my_polygons = None
+my_vertices = None
+poly_normals = None
+poly_curvatures = None
+callback_finished = None
+my_point_cloud = PolygonMesh
 
 class Mesh():
     """ Abstract class to represent 3D polygon meshes. """
@@ -84,6 +101,8 @@ class Mesh():
         # Initialize device on which tensors reside.
         self.device = self.vertices.device
 
+        
+
     @classmethod
     def from_tensors(cls, vertices: torch.Tensor, faces: torch.Tensor,
                      uvs: torch.Tensor = None,
@@ -116,7 +135,7 @@ class Mesh():
     @_composedecorator(classmethod, abstractmethod)
     def from_obj(self, filename: str, with_vt: bool = False,
                  enable_adjacency: bool = False, texture_res=4):
-        r"""Loads object in .obj wavefront format.
+        """Loads object in .obj wavefront format.
 
         Args:
             filename (str) : location of file.
@@ -148,7 +167,7 @@ class Mesh():
                 if data[0] == 'v':
                     vertices.append(data[1:])
                 elif data[0] == 'vt':
-                    uvs.append(data[1:3])
+                    uvs.append(data[1:])
                 elif data[0] == 'f':
                     if '//' in data[1]:
                         data = [da.split('//') for da in data]
@@ -202,10 +221,86 @@ class Mesh():
                     ef, ef_count, ee, ee_count)
         return output
 
+
     @classmethod
     def from_off(self, filename: str,
                  enable_adjacency: Optional[bool] = False):
-        r"""Loads a mesh from a .off file.
+        """Loads a mesh from a .off file.
+        Args:
+            filename (str): Path to the .off file.
+            enable_adjacency (str): Whether or not to compute adjacency info.
+        Returns:
+            (kaolin.rep.Mesh): Mesh object.
+        """
+        vertices = []
+        faces = []
+        num_vertices = 0
+        num_faces = 0
+        num_edges = 0
+        # Flag to store the number of vertices, faces, and edges that have
+        # been read.
+        read_vertices = 0
+        read_faces = 0
+        read_edgs = 0
+        # Flag to indicate whether or not metadata (number of vertices,
+        # number of faces, (optionally) number of edges) has been read.
+        # For .off files, metadata is the first valid line of each file
+        # (neglecting the "OFF" header).
+        metadata_read = False
+        with open(filename, 'r') as infile:
+            for line in infile.readlines():
+                # Ignore comments
+                if line.startswith('#'):
+                    continue
+                if line.startswith('OFF'):
+                    continue
+                data = line.strip().split()
+                data = [da for da in data if len(da) > 0]
+                # Ignore blank lines
+                if len(data) == 0:
+                    continue
+                if metadata_read is False:
+                    num_vertices = int(data[0])
+                    num_faces = int(data[1])
+                    if len(data) == 3:
+                        num_edges = int(data[2])
+                    metadata_read = True
+                    continue
+                if read_vertices < num_vertices:
+                    vertices.append([float(d) for d in data])
+                    read_vertices += 1
+                    continue
+                if read_faces < num_faces:
+                    numedges = int(data[0])
+                    faces.append([int(d) for d in data[1:1+numedges]])
+                    read_faces += 1
+                    continue
+                if read_edges < num_edges:
+                    edges.append([int(d) for d in data[1:]])
+                    read_edges += 1
+                    continue
+        vertices = torch.FloatTensor(np.array(vertices, dtype=np.float32))
+        faces = torch.LongTensor(np.array(faces, dtype=np.int64))
+
+        if enable_adjacency:
+            edge2key, edges, vv, vv_count, ve, ve_count, vf, vf_count, ff, ff_count, \
+                ee, ee_count, ef, ef_count = self.compute_adjacency_info(
+                    vertices, faces)
+        else:
+            edge2key, edges, vv, vv_count, ve, ve_count, vf, vf_count, ff, \
+                ff_count, ee, ee_count, ef, ef_count = None, None, None, \
+                None, None, None, None, None, None, None, None, None, None, \
+                None
+
+        return self(vertices, faces, None, None, None, edges,
+                    edge2key, vv, vv_count, vf, vf_count, ve, ve_count, ff, ff_count,
+                    ef, ef_count, ee, ee_count)
+
+
+    @classmethod
+    def fk(self, filename: str,
+                 enable_adjacency: Optional[bool] = False):
+        """Loads a mesh from a .off file.
 
         Args:
             filename (str): Path to the .off file.
@@ -278,6 +373,194 @@ class Mesh():
         return self(vertices, faces, None, None, None, edges,
                     edge2key, vv, vv_count, vf, vf_count, ve, ve_count, ff, ff_count,
                     ef, ef_count, ee, ee_count)
+
+    @classmethod
+    def callback(point_cloud):
+        my_point_cloud=point_cloud
+        vertices = []
+        face_vertices = my_point_cloud.polygons
+        len_faces=len(face_vertices)
+        faces=[]
+        for i in range (len_faces):
+            faces.append(face_vertices[i].vertices)
+        width_pc = my_point_cloud.cloud.width
+        points_bytes = my_point_cloud.cloud.data
+        poly_normals = []
+        poly_curvatures = []
+        points_int=list(points_bytes)
+        points_float=[]
+        for i in range (width_pc):
+            p_int=points_int[i*48:i*48+48]
+            p_float=[]
+            for j in range (12):
+                p_int_sub_4=p_int[j*4:j*4+4]
+                p_byte_sub=bytes(p_int_sub_4)
+                p_float_sub=struct.unpack('f', p_byte_sub)[0]
+                p_float.append(p_float_sub)
+            points_float.append(p_float)
+            vert=p_float[0:3]
+            vertices.append(vert)
+        my_vertices = torch.FloatTensor(np.array(vertices, dtype=np.float32))
+        my_polygons = torch.LongTensor(np.array(faces, dtype=np.int64))
+        #callback_finished = True
+
+    @classmethod
+    def from_mesh(self, filename: str,
+                 enable_adjacency: Optional[bool] = False):
+        """Loads a mesh from a rostopic pcl_meshtriangle
+        Args:
+            filename (str): name of the topic (preferably pcl_meshtriangle).
+            enable_adjacency (str): Whether or not to compute adjacency info.
+        Returns:
+            (kaolin.rep.Mesh): Mesh object.
+        """
+        #my_vertices = torch.Tensor
+        #my_polygons = torch.Tensor
+
+        #callback_finished = False
+        
+        # Initialize ros subscriber
+        rospy.init_node('listener', anonymous=True)
+        #rospy.Subscriber("pcl_meshtriangle", PolygonMesh , self.callback)
+        my_point_cloud=rospy.wait_for_message("pcl_meshtriangle", PolygonMesh)
+        rospy.sleep(0.2)
+        vertices = []
+        face_vertices = my_point_cloud.polygons
+        len_faces=len(face_vertices)
+        faces=[]
+        for i in range (len_faces):
+            faces.append(face_vertices[i].vertices)
+        width_pc = my_point_cloud.cloud.width
+        points_bytes = my_point_cloud.cloud.data
+        poly_normals = []
+        poly_curvatures = []
+        points_int=list(points_bytes)
+        points_float=[]
+        for i in range (width_pc):
+            p_int=points_int[i*48:i*48+48]
+            p_float=[]
+            for j in range (12):
+                p_int_sub_4=p_int[j*4:j*4+4]
+                p_byte_sub=bytes(p_int_sub_4)
+                p_float_sub=struct.unpack('f', p_byte_sub)[0]
+                p_float.append(p_float_sub)
+            points_float.append(p_float)
+            vert=p_float[0:3]
+            vertices.append(vert)
+        my_vertices = torch.FloatTensor(np.array(vertices, dtype=np.float32))
+        my_polygons = torch.LongTensor(np.array(faces, dtype=np.int64))
+        
+        
+        b=my_polygons
+        a=my_vertices
+        return self(my_vertices, my_polygons, None, None, None, None,
+                    None, None, None, None, None, None, None, None, None,
+                    None, None, None, None)
+        # spin() simply keeps python from exiting until this node is stopped
+        #rospy.spin()
+
+
+
+    @classmethod
+    def from_vtk(self, filename: str,
+                 enable_adjacency: Optional[bool] = False):
+        r"""Loads a mesh from a .vtk file.
+        Args:
+            filename (str): Path to the .vtk file.
+            enable_adjacency (str): Whether or not to compute adjacency info.
+        Returns:
+            (kaolin.rep.Mesh): Mesh object.
+        """
+        vertices = []
+        faces = []
+        num_vertices = 0
+        num_faces = 0
+        num_edges = 0
+        # Flag to store the number of vertices, faces, and edges that have
+        # been read.
+        read_vertices = 0
+        read_points = 0
+        read_faces = 0
+        read_edgs = 0
+        # Flag to indicate whether or not metadata (number of vertices,
+        # number of faces, (optionally) number of edges) has been read.
+        # For .off files, metadata is the first valid line of each file
+        # (neglecting the "OFF" header).
+        metadata_read = False
+        with open(filename, 'r') as infile:
+            for line in infile.readlines():
+                # Ignore comments
+                if line.startswith('#'):
+                    continue
+                if line.startswith('VTK'):
+                    continue
+                if line.startswith('vtk'):
+                    continue
+                if line.startswith('ASCII'):
+                    continue
+                if line.startswith('ascii'):
+                    continue
+                if line.startswith('dataset'):
+                    continue
+                if line.startswith('DATASET'):
+                    continue
+                if line.startswith('VERTICES'):
+                    continue
+                if line.startswith('POINTS'):
+                    num_vertices=[int(s) for s in line.split() if s.digit()]
+                    num_points=num_vertices
+                    continue
+                data = line.strip().split()
+                data = [da for da in data if len(da) > 0]
+                # Ignore blank lines
+                if len(data) == 0:
+                    continue
+                r'''if metadata_read is False:
+                    num_vertices = int(data[0])
+                    num_faces = int(data[1])
+                    if len(data) == 3:
+                        num_edges = int(data[2])
+                    metadata_read = True
+                    continue'''
+                if read_vertices < num_vertices:
+                    vertices.append([float(d) for d in data])
+                    read_vertices += 1
+                    continue
+                if read_points < num_points:
+                    #vertices.append([float(d) for d in data])
+                    read_points += 1
+                    continue
+                if line.startswith('POLYGONS'):
+                    num_polygons=[int(s) for s in line.split() if s.digit()]
+                    num_faces=num_polygons[0]
+                    continue
+                if read_faces < num_faces:
+                    numedges = int(data[0])
+                    faces.append([int(d) for d in data[1:1+numedges]])
+                    read_faces += 1
+                    continue
+                if read_edges < num_edges:
+                    edges.append([int(d) for d in data[1:]])
+                    read_edges += 1
+                    continue
+        vertices = torch.FloatTensor(np.array(vertices, dtype=np.float32))
+        faces = torch.LongTensor(np.array(faces, dtype=np.int64))
+
+        if enable_adjacency:
+            edge2key, edges, vv, vv_count, ve, ve_count, vf, vf_count, ff, ff_count, \
+                ee, ee_count, ef, ef_count = self.compute_adjacency_info(
+                    vertices, faces)
+        else:
+            edge2key, edges, vv, vv_count, ve, ve_count, vf, vf_count, ff, \
+                ff_count, ee, ee_count, ef, ef_count = None, None, None, \
+                None, None, None, None, None, None, None, None, None, None, \
+                None
+
+        return self(vertices, faces, None, None, None, edges,
+                    edge2key, vv, vv_count, vf, vf_count, ve, ve_count, ff, ff_count,
+                    ef, ef_count, ee, ee_count)
+
+
 
     @staticmethod
     def _cuda_helper(tensor):
@@ -613,32 +896,6 @@ class Mesh():
         edges, edges_ids = torch.unique(edges, sorted=True, return_inverse=True, dim=0)
         nb_edges = edges.shape[0]
 
-        # EDGE2EDGES
-        _edges_ids = edges_ids.reshape(facesize, nb_faces)
-        edges2edges = torch.cat([
-            torch.stack([_edges_ids[1:], _edges_ids[:-1]], dim=-1).reshape(-1, 2),
-            torch.stack([_edges_ids[-1:], _edges_ids[:1]], dim=-1).reshape(-1, 2)
-        ], dim=0)
-
-        double_edges2edges = torch.cat([edges2edges, torch.flip(edges2edges, dims=(1,))], dim=0)
-        double_edges2edges = torch.cat(
-            [double_edges2edges, torch.arange(double_edges2edges.shape[0], device=device, dtype=torch.long).reshape(-1, 1)], dim=1)
-        double_edges2edges = torch.unique(double_edges2edges, sorted=True, dim=0)[:,:2]
-        idx_first = torch.where(
-            torch.nn.functional.pad(double_edges2edges[1:,0] != double_edges2edges[:-1,0],
-                                    (1, 0), value=1))[0]
-        nb_edges_per_edge = idx_first[1:] - idx_first[:-1]
-        offsets = torch.zeros(double_edges2edges.shape[0], device=device, dtype=torch.long)
-        offsets[idx_first[1:]] = nb_edges_per_edge
-        sub_idx = (torch.arange(double_edges2edges.shape[0], device=device,dtype=torch.long) -
-                   torch.cumsum(offsets, dim=0))
-        nb_edges_per_edge = torch.cat([nb_edges_per_edge,
-                                       double_edges2edges.shape[0] - idx_first[-1:]],
-                                      dim=0)
-        max_sub_idx = torch.max(nb_edges_per_edge)
-        ee = torch.full((nb_edges, max_sub_idx), device=device, dtype=torch.long, fill_value=-1)
-        ee[double_edges2edges[:,0], sub_idx] = double_edges2edges[:,1]
-
         # EDGE2FACE
         sorted_edges_ids, order_edges_ids = torch.sort(edges_ids)
         sorted_faces_ids = face_ids[order_edges_ids]
@@ -662,7 +919,7 @@ class Mesh():
                                        sorted_edges_ids.shape[0] - idx_first[-1:]],
                                       dim=0)
         max_sub_idx = torch.max(nb_faces_per_edge)
-        ef = torch.full((nb_edges, max_sub_idx), device=device, dtype=torch.long, fill_value=-1)
+        ef = torch.zeros((nb_edges, max_sub_idx), device=device, dtype=torch.long) - 1
         ef[sorted_edges_ids, sub_idx] = sorted_faces_ids
         # FACE2FACES
         nb_faces_per_face = torch.stack([nb_faces_per_edge[edges_ids[i*nb_faces:(i+1)*nb_faces]]
@@ -702,11 +959,17 @@ class Mesh():
         nb_edges_per_vertex = torch.cat([nb_edges_per_vertex,
                                          nb_double_edges - idx_first[-1:]], dim=0)
         max_sub_idx = torch.max(nb_edges_per_vertex)
-        vv = torch.full((nb_vertices, max_sub_idx), device=device, dtype=torch.long, fill_value=-1)
+        vv = torch.zeros((nb_vertices, max_sub_idx), device=device, dtype=torch.long) - 1
         vv[double_edges[:,0], sub_idx] = double_edges[:,1]
-        ve = torch.full((nb_vertices, max_sub_idx), device=device, dtype=torch.long, fill_value=-1)
+        ve = torch.zeros((nb_vertices, max_sub_idx), device=device, dtype=torch.long) - 1
         ve[double_edges[:,0], sub_idx] = double_edges[:,2]
-
+        # EDGE2EDGES
+        ee = torch.cat([ve[edges[:,0],:], ve[edges[:,1],:]], dim=1)
+        nb_edges_per_edge = nb_edges_per_vertex[edges[:,0]] + nb_edges_per_vertex[edges[:,1]] - 2
+        max_sub_idx = torch.max(nb_edges_per_edge)
+        # remove self occurences
+        ee[ee == torch.arange(nb_edges, device=device, dtype=torch.long).view(-1,1)] = -1
+        ee = torch.sort(ee, dim=-1, descending=True)[0][:,:max_sub_idx]
         # VERTEX2FACES
         vertex_ordered, order_vertex = torch.sort(faces.view(-1))
         face_ids_in_vertex_order = order_vertex / facesize
@@ -723,7 +986,7 @@ class Mesh():
         nb_faces_per_vertex = torch.cat([nb_faces_per_vertex,
                                          vertex_ordered.shape[0] - idx_first[-1:]], dim=0)
         max_sub_idx = torch.max(nb_faces_per_vertex)
-        vf = torch.full((nb_vertices, max_sub_idx), device=device, dtype=torch.long, fill_value=-1)
+        vf = torch.zeros((nb_vertices, max_sub_idx), device=device, dtype=torch.long) - 1
         vf[vertex_ordered, sub_idx] = face_ids_in_vertex_order
 
         return edge2key, edges, vv, nb_edges_per_vertex, ve, nb_edges_per_vertex, vf, \
@@ -784,8 +1047,8 @@ class Mesh():
                     q = edge2key[face_edges[(idx + j) % facesize]]
                     common_vtx, first_nbr, second_nbr = Mesh.get_common_vertex(
                         edges[k], edges[q])
-                    edge_edge_nbd[k].append(q)
                     if common_vtx:
+                        edge_edge_nbd[k].append(q)
                         vertex_vertex_nbd[common_vtx].add(first_nbr)
                         vertex_vertex_nbd[common_vtx].add(second_nbr)
                         vertex_vertex_nbd[first_nbr].add(common_vtx)
@@ -987,24 +1250,3 @@ class Mesh():
 
     def compute_dihedral_angles_per_edge(self):
         raise NotImplementedError
-
-    def __getstate__(self):
-        outputs = {'vertices': self.vertices,
-                   'faces': self.faces}
-        if self.uvs is not None:
-            outputs['uvs'] = self.uvs
-        if self.face_textures is not None:
-            outputs['face_textures'] = self.face_textures
-        if self.textures is not None:
-            outputs['textures'] = self.textures
-        return outputs
-
-    def __setstate__(self, args):
-        self.vertices = args['vertices']
-        self.faces = args['faces']
-        if 'uvs' in args:
-            self.uvs = args['uvs']
-        if 'face_textures' in args:
-            self.face_textures = args['face_textures']
-        if 'textures' in args:
-            self.textures = args['textures']
