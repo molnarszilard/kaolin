@@ -7,10 +7,10 @@ from .scannet import *
 import matplotlib
 matplotlib.use('Agg')
 
-try:
-    from .nusc import NuscDetection
-except ImportError as err:
-    import_err = err
-    import traceback
-    print("Warning: unable to import datasets/nusc:\n   %s" % import_err)
-    print("Warning: unable to import datasets/nusc:\n   %s" % traceback.print_exc())
+#try:
+#    from .nusc import NuscDetection
+#except ImportError as err:
+#    import_err = err
+#    import traceback
+#    print("Warning: unable to import datasets/nusc:\n   %s" % import_err)
+#    print("Warning: unable to import datasets/nusc:\n   %s" % traceback.print_exc())
